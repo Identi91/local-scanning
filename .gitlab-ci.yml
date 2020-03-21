@@ -1,0 +1,155 @@
+stages:
+  - lint
+  - scan
+  - build
+
+kubetoolbox-lint:
+  image:
+    entrypoint: ["/bin/sh", "-c"]
+    name: redcoolbeans/dockerlint
+  stage: lint
+  script: dockerlint -f kube-toolbox/Dockerfile
+  tags:
+    - development
+
+kubetoolbox-scan:
+# This scans the image without pushing it. The job fails when vulnerabilities are found.
+  image: docker:stable
+  stage: scan
+  services:
+    - name: docker:18.09-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: ''
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - apk add --no-cache curl jq python py-pip ansible wget ca-certificates > /dev/null
+    - pip install awscli  > /dev/null
+    - $(aws ecr get-login --no-include-email --region eu-central-1)
+    - wget -q https://github.com/arminc/clair-scanner/releases/download/v12/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 /usr/local/bin/clair-scanner && chmod 777 /usr/local/bin/clair-scanner
+  script:
+    - |
+      cd kube-toolbox
+      docker build --pull -t "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest" .
+
+      echo "Launching a standalone clair server with prefilled DB"
+      docker run -p 5432:5432 -d --name db arminc/clair-db:latest
+      docker run -p 6060:6060 --link db:postgres -d --name clair arminc/clair-local-scan:v2.0.6
+
+      echo "scanning using local clair stack"
+      clair-scanner --clair="http://docker:6060" --ip $(hostname -i) \
+      -r klar-container-scanning-report.json 111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest
+      docker rm -f clair && docker rm -f db
+      echo "Scanning image done, reporting below.."
+      cat klar-container-scanning-report.json | jq .
+  dependencies: []
+  artifacts:
+    reports:
+      container_scanning: kube-toolbox/klar-container-scanning-report.json
+  tags:
+    - development
+
+kubetoolbox-build:
+# This implementation of the job requires a registry.
+# This job scans the image and pushes it regardless of vulnerability status. It then runs the gitlab version of the scanner, pulls the image and scans it
+# outputting the report and suggestions on what to do in json format. If you have Gitlab Ultimate, the report will be displayed next to Merge Requests,
+# otherwise it is just visible in the pipeline output, or as artifact
+  image: docker:stable
+  stage: build
+  services:
+    - name: docker:18.09-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: ''
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - apk add --no-cache curl jq python py-pip ansible wget ca-certificates > /dev/null
+    - pip install awscli  > /dev/null
+    - $(aws ecr get-login --no-include-email --region eu-central-1)
+    - wget -q https://github.com/arminc/clair-scanner/releases/download/v12/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 /usr/local/bin/clair-scanner && chmod 777 /usr/local/bin/clair-scanner
+  script:
+    - |
+      cd kube-toolbox
+      docker build --pull -t "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest" .
+
+      echo "Pushing latest so Klar can scan it"
+      docker push "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest"
+      echo "Launching a prefilled CVE DB and get local IP on Docker bridge network"
+      docker run --name prefilledcvedb -p 5432:5432 -d arminc/clair-db:latest
+      LOCAL_PRIVATE_DB_IP=$(docker inspect -f "{{ .NetworkSettings.IPAddress }}" prefilledcvedb)
+      echo "Parse ECR login credentials to give to Klar"
+      DOCKER_LOGIN=`aws ecr get-login --no-include-email --region eu-central-1`
+      PASSWORD=`echo $DOCKER_LOGIN | cut -d' ' -f6`
+      REGISTRY=`echo $DOCKER_LOGIN | cut -d' ' -f7 | sed "s/https:\/\///"`
+      docker run \
+        --rm \
+        --volume "$PWD":/tmp/app \
+        -e DOCKER_USER=AWS \
+        -e DOCKER_PASSWORD=$PASSWORD \
+        -e CI_PROJECT_DIR=/tmp/app \
+        -e CLAIR_DB_CONNECTION_STRING="postgresql://postgres:password@$LOCAL_PRIVATE_DB_IP:5432/postgres?sslmode=disable&statement_timeout=60000" \
+        -e CI_APPLICATION_REPOSITORY=${REGISTRY}/kube-workbox \
+        -e CI_APPLICATION_TAG=latest \
+        registry.gitlab.com/gitlab-org/security-products/analyzers/klar
+      echo "Scanning image done, reporting below.."
+      cat gl-container-scanning-report.json | jq .
+      docker rm -f prefilledcvedb
+
+      docker tag "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest" "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:$CI_COMMIT_SHORT_SHA"
+      docker push "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:$CI_COMMIT_SHORT_SHA"
+  dependencies: []
+  artifacts:
+    reports:
+      container_scanning: kube-toolbox/gl-container-scanning-report.json
+  only:
+    - master
+  tags:
+    - production
+
+.kubetoolbox-scanlocal:
+# This implementation of the job achieves the same as the above one, but does not require a registry.
+# It breaks the build if an image is vulnerable before pushing it, so bad artifacts will never be published.
+# This job scans the image using arminc's scanner.
+# If that passes, the build will be published (the image will be pushed).
+  image: docker:stable
+  stage: build
+  services:
+    - name: docker:18.09-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: ''
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - apk add --no-cache curl jq python py-pip ansible wget ca-certificates > /dev/null
+    - pip install awscli  > /dev/null
+    - $(aws ecr get-login --no-include-email --region eu-central-1)
+    - wget -q https://github.com/arminc/clair-scanner/releases/download/v12/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 /usr/local/bin/clair-scanner && chmod 777 /usr/local/bin/clair-scanner
+  script:
+    - |
+      cd kube-toolbox
+      docker build --pull -t "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest" .
+
+      echo "Launching a standalone clair server with prefilled DB"
+      docker run -p 5432:5432 -d --name db arminc/clair-db:latest
+      docker run -p 6060:6060 --link db:postgres -d --name clair arminc/clair-local-scan:v2.0.6
+
+      echo "scanning using local clair stack"
+      clair-scanner --clair="http://docker:6060" --ip $(hostname -i) \
+      -r klar-container-scanning-report.json 111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest || exit 0
+      docker rm -f clair && docker rm -f db
+      echo "Scanning image done, reporting below.."
+      cat klar-container-scanning-report.json | jq .
+
+      docker tag "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:latest" "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:$CI_COMMIT_SHORT_SHA"
+      docker push "111111111111.dkr.ecr.eu-central-1.amazonaws.com/kube-workbox:$CI_COMMIT_SHORT_SHA"
+  dependencies: []
+  artifacts:
+    reports:
+      container_scanning: kube-toolbox/klar-container-scanning-report.json
+  only:
+    - master
+  tags:
+    - production
